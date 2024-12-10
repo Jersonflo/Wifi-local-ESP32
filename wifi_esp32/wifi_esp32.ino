@@ -1,14 +1,18 @@
 #include <WiFi.h>
-#include <FS.h>         // Para trabajar con el sistema de archivos
-#include <SPIFFS.h>     // Sistema de archivos para ESP32
-#include <WebServer.h>  // Servidor web
+#include <DNSServer.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <WebServer.h>
+#include <time.h>
 
 // Configuración WiFi
 const char* ssid = "Aula-STEM";
-const char* password = "unalman";
+const char* password = "unalman123";
 
 // Configuración del servidor
 WebServer server(80);
+DNSServer dnsServer;  // Servidor DNS para el portal cautivo
+const byte DNS_PORT = 53;
 
 // Página HTML con formulario
 String html = R"rawliteral(
@@ -47,15 +51,23 @@ String html = R"rawliteral(
     <h1>Registro de Asistencia</h1>
     <form action='/submit' method='POST'>
       <input type='text' name='nombre' placeholder='Ingresa tu nombre' required><br>
+      <input type='text' name='celular' placeholder='Celular' required><br>
+      <input type='email' name='correo' placeholder='Correo electronico' required><br>
+      <input type='text' name='proyecto' placeholder='Proyecto' required><br>
       <input type='number' name='horas' placeholder='Horas asistidas' required><br>
-      <input type='date' name='fecha' required><br>
+      <input type='hidden' name='fecha' id='fecha'>
       <input type='submit' value='Registrar'>
     </form>
+    <script>
+      document.getElementById('fecha').value = new Date().toISOString().split('T')[0];
+    </script>
+    <p><a href="/download">Descargar archivo CSV</a></p>
+    <p><a href="/delete">Eliminar todos los registros</a></p>
   </body>
 </html>
 )rawliteral";
 
-// Función para inicializar SPIFFS
+// Inicializar SPIFFS
 void initSPIFFS() {
   if (!SPIFFS.begin(true)) {
     Serial.println("Error al inicializar SPIFFS");
@@ -64,70 +76,67 @@ void initSPIFFS() {
   Serial.println("SPIFFS inicializado");
 }
 
-// Función para manejar la página principal
-void handleRoot() {
-  server.send(200, "text/html", html);
+// Redirigir al formulario (Captive Portal)
+void handleCaptivePortal() {
+  server.sendHeader("Location", "/formulario", true); // Redirección al formulario
+  server.send(302, "text/plain", "Redirigiendo...");
 }
 
-// Función para manejar el envío del formulario
+// Manejar la página raíz
+void handleRoot() {
+  String redirectHtml = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta http-equiv="refresh" content="0;url=/formulario">
+      </head>
+      <body>
+        <p>Redirigiendo al formulario de asistencia...</p>
+        <a href="/formulario">Haz clic aquí si no redirige automáticamente.</a>
+      </body>
+    </html>
+  )rawliteral";
+  server.send(200, "text/html", redirectHtml);
+}
+
+// Manejar el formulario
 void handleSubmit() {
   String nombre = server.arg("nombre");
+  String celular = server.arg("celular");
+  String correo = server.arg("correo");
+  String proyecto = server.arg("proyecto");
   String horas = server.arg("horas");
   String fecha = server.arg("fecha");
 
-  // Validar duplicados
-  if (isDuplicate(nombre, fecha)) {
-    server.send(200, "text/html", "<h1>Ya registraste tu asistencia para esta fecha!</h1>");
-    return;
-  }
-
-  // Guardar datos en el archivo CSV
   File file = SPIFFS.open("/asistencia.csv", FILE_APPEND);
-  if (!file) {
-    Serial.println("Error al abrir el archivo");
-    server.send(500, "text/plain", "Error al guardar la asistencia");
-    return;
-  }
-
-  // Escribir los datos en formato CSV
-  file.printf("%s,%s,%s\n", nombre.c_str(), horas.c_str(), fecha.c_str());
+  file.printf("%s,%s,%s,%s,%s,%s\n", nombre.c_str(), celular.c_str(), correo.c_str(), proyecto.c_str(), horas.c_str(), fecha.c_str());
   file.close();
 
   server.send(200, "text/html", "<h1>Asistencia registrada correctamente!</h1>");
-  Serial.printf("Datos guardados: %s, %s, %s\n", nombre.c_str(), horas.c_str(), fecha.c_str());
 }
 
-// Verificar duplicados
-bool isDuplicate(String nombre, String fecha) {
-  File file = SPIFFS.open("/asistencia.csv", FILE_READ);
-  if (!file) {
-    return false;  // No hay duplicados si el archivo no existe
-  }
 
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.indexOf(nombre + "," + fecha) != -1) {
-      file.close();
-      return true;  // Se encontró un duplicado
-    }
-  }
-  file.close();
-  return false;
-}
-
-// Función para leer el archivo CSV (opcional, para depuración)
-void readCSV() {
-  File file = SPIFFS.open("/asistencia.csv", FILE_READ);
-  if (!file) {
-    Serial.println("No hay datos registrados");
+// Manejar la descarga del archivo CSV
+void handleDownload() {
+  if (!SPIFFS.exists("/asistencia.csv")) {
+    server.send(404, "text/plain", "Archivo no encontrado");
     return;
   }
 
-  Serial.println("Datos registrados:");
-  while (file.available()) {
-    Serial.println(file.readStringUntil('\n'));
-  }
+  File file = SPIFFS.open("/asistencia.csv", "r");
+  server.streamFile(file, "text/csv");
   file.close();
+}
+
+
+// Manejar la eliminación de todos los registros
+void handleDelete() {
+  if (SPIFFS.exists("/asistencia.csv")) {
+    SPIFFS.remove("/asistencia.csv");
+    server.send(200, "text/html", "<h1>Registros eliminados correctamente.</h1><a href='/formulario'>Regresar</a>");
+  } else {
+    server.send(200, "text/html", "<h1>No hay registros para eliminar.</h1><a href='/formulario'>Regresar</a>");
+  }
 }
 
 void setup() {
@@ -136,18 +145,34 @@ void setup() {
   // Inicializar SPIFFS
   initSPIFFS();
 
-  // Configurar WiFi
+  // Configurar punto de acceso
   WiFi.softAP(ssid, password);
-  Serial.println("Punto de acceso iniciado");
-  Serial.println("IP: " + WiFi.softAPIP().toString());
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
 
-  // Configurar rutas del servidor
+  // Configurar servidor DNS para capturar todas las solicitudes
+  dnsServer.start(DNS_PORT, "*", IP);
+
+  // Configurar tiempo NTP
+  configTime(0, 0, "pool.ntp.org");
+  setenv("TZ", "COT5", 1);
+  tzset();
+
+  // Configurar rutas del servidor web
   server.on("/", handleRoot);
+  server.on("/formulario", []() {
+    server.send(200, "text/html", html);
+  });
   server.on("/submit", HTTP_POST, handleSubmit);
+  server.on("/download", handleDownload);
+  server.on("/delete", handleDelete);
+  server.onNotFound(handleCaptivePortal);  // Redirigir todas las solicitudes desconocidas al portal
 
   server.begin();
 }
 
 void loop() {
-  server.handleClient();
+  dnsServer.processNextRequest(); // Procesar solicitudes DNS
+  server.handleClient();          // Procesar solicitudes HTTP
 }
